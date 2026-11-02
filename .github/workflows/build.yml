@@ -1,0 +1,187 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout Nyxa
+        uses: actions/checkout@v4
+        with:
+          path: nyxa
+
+      - name: Checkout Telegram-iOS source
+        run: |
+          set -euo pipefail
+          UPSTREAM_COMMIT=$(cat nyxa/UPSTREAM_COMMIT)
+          sudo mkdir -p /Users/Shared/telegram-ios
+          sudo chown "$(whoami)" /Users/Shared/telegram-ios
+          cd /Users/Shared/telegram-ios
+          git init -q
+          git remote add origin https://github.com/TelegramMessenger/Telegram-iOS.git
+          git fetch -q --depth 1 origin "$UPSTREAM_COMMIT"
+          git checkout -q FETCH_HEAD
+          git submodule update --init --recursive --depth 1 --jobs 8 || git submodule update --init --recursive --jobs 8
+
+      - name: Apply Nyxa patch
+        run: |
+          set -euo pipefail
+          cd /Users/Shared/telegram-ios
+          git apply --whitespace=nowarn "$GITHUB_WORKSPACE/nyxa/nyxa.patch"
+          git status --short
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          WANTED=$(python3 -c 'import json;print(json.load(open("/Users/Shared/telegram-ios/versions.json"))["xcode"])')
+          if [ -d "/Applications/Xcode_$WANTED.app" ]; then
+            XCODE="/Applications/Xcode_$WANTED.app"
+          else
+            echo "Xcode $WANTED not found, available:"; ls -d /Applications/Xcode*.app
+            XCODE=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          fi
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: Free disk space
+        run: |
+          CURRENT=$(xcode-select -p | sed 's|/Contents/Developer||')
+          for x in /Applications/Xcode*.app; do
+            if [ "$x" != "$CURRENT" ] && [ ! -L "$x" ]; then sudo rm -rf "$x" & fi
+          done
+          sudo rm -rf ~/Library/Android /usr/local/share/dotnet /usr/local/lib/node_modules ~/.dotnet &
+          wait
+          df -h /
+
+      - name: Restore Bazel cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-${{ hashFiles('nyxa/UPSTREAM_COMMIT') }}-${{ hashFiles('nyxa/nyxa.patch') }}
+          restore-keys: |
+            bazel-${{ hashFiles('nyxa/UPSTREAM_COMMIT') }}-
+            bazel-
+
+      - name: Write build configuration
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TELEGRAM_API_ID" ] || [ -z "$TELEGRAM_API_HASH" ]; then
+            echo "TELEGRAM_API_ID / TELEGRAM_API_HASH secrets are not set"; exit 1
+          fi
+          python3 - <<'PY'
+          import json, os
+          p = os.path.join(os.environ["GITHUB_WORKSPACE"], "nyxa", "configuration.json")
+          c = json.load(open(p))
+          c["api_id"] = os.environ["TELEGRAM_API_ID"]
+          c["api_hash"] = os.environ["TELEGRAM_API_HASH"]
+          json.dump(c, open(p, "w"), indent=4)
+          PY
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cd /Users/Shared/telegram-ios
+          BUILD_NUMBER=$(( $(cat build_number_offset) + ${{ github.run_number }} + 100000 ))
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> $GITHUB_ENV
+          echo "APP_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["app"])')" >> $GITHUB_ENV
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          python3 -u build-system/Make/Make.py \
+            --overrideXcodeVersion \
+            --bazelUserRoot=/private/var/tmp/_bazel_nyxa \
+            --cacheDir="$HOME/telegram-bazel-cache" \
+            build \
+            --configurationPath="$GITHUB_WORKSPACE/nyxa/configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER" \
+            --continueOnError
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp bazel-bin/Telegram/Telegram.ipa "$GITHUB_WORKSPACE/out/Nyxa.ipa"
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      - name: Trim Bazel cache
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os
+          root = os.path.expanduser("~/telegram-bazel-cache")
+          limit = 9 * 1024 ** 3
+          files, total = [], 0
+          for d, _, names in os.walk(root):
+              for n in names:
+                  p = os.path.join(d, n)
+                  try:
+                      st = os.stat(p)
+                  except OSError:
+                      continue
+                  files.append((st.st_mtime, st.st_size, p))
+                  total += st.st_size
+          print("cache size: %.1f GB" % (total / 1e9))
+          if total > limit:
+              files.sort()
+              for _, size, p in files:
+                  os.remove(p)
+                  total -= size
+                  if total <= limit:
+                      break
+              print("trimmed to %.1f GB" % (total / 1e9))
+          PY
+
+      - name: Save Bazel cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-${{ hashFiles('nyxa/UPSTREAM_COMMIT') }}-${{ hashFiles('nyxa/nyxa.patch') }}-${{ github.run_id }}
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          W=$(mktemp -d)
+          cd "$W"
+          unzip -q "$GITHUB_WORKSPACE/out/Nyxa.ipa"
+          APP=Payload/Telegram.app
+          brew install ldid >/dev/null
+          for f in "$APP"/Frameworks/*.framework/*Framework; do ldid -S "$f"; done
+          ldid -S "$APP/Telegram"
+          find Payload -name _CodeSignature -type d -prune -exec rm -rf {} +
+          rm -f "$APP/embedded.mobileprovision"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.nyxa.app" "$APP/Info.plist"
+          for fw in "$APP"/Frameworks/*.framework; do
+            ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$fw/Info.plist")
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${ID/ph.telegra.Telegraph/com.nyxa.app}" "$fw/Info.plist"
+          done
+          zip -qry "$GITHUB_WORKSPACE/out/Nyxagram.ipa" Payload
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nyxagram
+          path: out/Nyxagram.ipa
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="v${APP_VERSION}-${BUILD_NUMBER}"
+          gh release create "$TAG" out/Nyxagram.ipa \
+            --repo "${{ github.repository }}" \
+            --title "Nyxagram ${APP_VERSION} (${BUILD_NUMBER})" \
+            --notes "iOS 15+"
